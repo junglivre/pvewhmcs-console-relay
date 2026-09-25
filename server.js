@@ -183,18 +183,19 @@ function createRelay(config) {
 
                 return;
             }
-            session.readyPromise.then(() => {
-                log('prewarm', { sid: payload.sid, host: payload.host });
-                res.writeHead(200, Object.assign({}, corsHeaders, {
-                    'Content-Type': 'application/json',
-                }));
-                res.end(JSON.stringify({ ready: true }));
-            }).catch(() => {
-                res.writeHead(502, Object.assign({}, corsHeaders, {
-                    'Content-Type': 'application/json',
-                }));
-                res.end(JSON.stringify({ ready: false, error: 'upstream unavailable' }));
-            });
+
+            // Respond as soon as the upstream connection attempt has been
+            // kicked off, not once it fully completes. Proxmox's vncproxy
+            // attach window starts counting from the vncproxy API call, so
+            // what matters here is starting the WebSocket handshake to
+            // Proxmox promptly; waiting for it to finish before replying
+            // would tie this response's latency to Proxmox reachability
+            // and defeat the purpose of preconnecting early.
+            log('prewarm', { sid: payload.sid, host: payload.host });
+            res.writeHead(200, Object.assign({}, corsHeaders, {
+                'Content-Type': 'application/json',
+            }));
+            res.end(JSON.stringify({ ready: true }));
 
             return;
         }
