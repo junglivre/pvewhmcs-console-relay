@@ -144,7 +144,18 @@ Adjust the port in any of the above to match `listenPort` in `config.json`.
 3. If it fails immediately with code `4401`, the token was invalid/expired —
    check the relay's log (`journalctl -u pvewhmcs-console-relay`) and
    confirm both secrets match exactly.
-4. If the WebSocket never reaches `open`, the reverse proxy likely isn't
+4. If noVNC reports `1011` with reason `upstream error`, the relay reached
+   the browser but could not open Proxmox's WebSocket. Inspect the same log
+   for `upstream-error`, `upstream-http-error`, or `upstream-close`:
+   - `ENOTFOUND`, `EAI_AGAIN`, `ECONNREFUSED`, or `ETIMEDOUT` means the relay
+     cannot resolve or reach the configured Proxmox hostname/port.
+   - Certificate errors mean the relay cannot validate the Proxmox certificate;
+     fix the certificate/hostname or deliberately disable Secure for that
+     WHMCS server.
+   - An HTTP status in `upstream-http-error` means Proxmox rejected the
+     WebSocket request; verify the `vnc@pve` user has only the documented
+     `VM.Console` permission and that the VM still exists.
+5. If the WebSocket never reaches `open`, the reverse proxy likely isn't
    passing the `Upgrade` header through — re-check Section 2.
 
 ## Security notes

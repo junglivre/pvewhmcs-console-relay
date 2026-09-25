@@ -201,12 +201,28 @@ function createRelay(config) {
                 clientWs.send(data);
             }
         });
-        upstream.on('close', () => {
+        upstream.on('close', (code, reason) => {
+            log('upstream-close', {
+                sid: payload.sid,
+                host: payload.host,
+                port: payload.port || 8006,
+                code,
+                reason: reason.toString(),
+            });
             clearTimeout(sessionTimer);
             closeBoth(1000, 'upstream closed');
         });
+        upstream.on('unexpected-response', (_request, response) => {
+            log('upstream-http-error', {
+                sid: payload.sid,
+                host: payload.host,
+                port: payload.port || 8006,
+                statusCode: response.statusCode,
+                statusMessage: response.statusMessage,
+            });
+        });
         upstream.on('error', (err) => {
-            log('upstream-error', { sid: payload.sid, message: err.message });
+            log('upstream-error', { sid: payload.sid, host: payload.host, port: payload.port || 8006, message: err.message });
             clearTimeout(sessionTimer);
             closeBoth(1011, 'upstream error');
         });
