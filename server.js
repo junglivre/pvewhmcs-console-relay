@@ -168,8 +168,12 @@ function createRelay(config) {
         }
 
         const upstreamUrl = `wss://${payload.host}:${payload.port || 8006}/${payload.path}`;
+        const upstreamOrigin = `https://${payload.host}:${payload.port || 8006}`;
         const upstream = new WebSocket(upstreamUrl, {
-            headers: { Cookie: 'PVEAuthCookie=' + payload.cookie },
+            headers: {
+                Cookie: 'PVEAuthCookie=' + payload.cookie,
+                Origin: upstreamOrigin,
+            },
             rejectUnauthorized: payload.verify !== false,
             handshakeTimeout: 10000,
         });
