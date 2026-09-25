@@ -33,11 +33,11 @@ Same domain:  Browser --wss--> WHMCS domain (443) --reverse proxy /pve-console-w
 Subdomain:    Browser --wss--> vnc.example.com (443) -----------reverse proxy /---------> relay (127.0.0.1:8765) --wss--> Proxmox:8006 (private)
 ```
 
-`pvewhmcs_noVNC()` (in the WHMCS module) mints a short-lived, HMAC-signed,
-single-use token describing the Proxmox target (host, path, the restricted
-`vnc@pve` PVEAuthCookie). The browser only ever sees that opaque token. This
-relay verifies it, opens the real connection to Proxmox, and pipes bytes
-both ways.
+`pvewhmcs_noVNC()` first asks the relay to open the Proxmox WebSocket and wait
+for the browser. It then hands the already-connected session to noVNC. This
+prewarm/handoff is intentional: the Proxmox VNC proxy has a short attachment
+timeout, while a browser may still be loading a slow tab or noVNC assets.
+The relay verifies the same short-lived, HMAC-signed token for both requests.
 
 If you deploy the relay on its own subdomain, set that subdomain in WHMCS
 under **Addons > Proxmox VE for WHMCS > Config > Console Relay Host** (and
@@ -134,7 +134,8 @@ Adjust the port in any of the above to match `listenPort` in `config.json`.
 ## 3. Verify
 
 1. In WHMCS Client Area, request a console for an active VM/CT.
-2. Click "Launch noVNC". The browser should connect to
+2. The WHMCS launcher must wait for the relay's prewarm response before
+   opening noVNC. The browser should then connect to
    `wss://<console-relay-host>/pve-console-ws/<token>` — where
    `<console-relay-host>` is either your dedicated subdomain (Console Relay
    Host in Module Config) or the WHMCS domain if you left that blank. Check
@@ -163,8 +164,8 @@ Adjust the port in any of the above to match `listenPort` in `config.json`.
 - Rotate `secret` by updating it in both places (WHMCS Module Config and
   `config.json`) — old, in-flight tokens simply stop validating.
 - The relay never touches the WHMCS database or PVE credentials beyond what
-  each token carries; a leaked relay log line still requires the signed
-  token to reconnect, and tokens expire in under a minute.
+  each token carries. The signed token is held only until the browser handoff
+  completes and expires after five minutes.
 - Keep `listenPort` bound to `127.0.0.1` (already the default) so it is only
   reachable through the reverse proxy, never directly from the Internet.
 

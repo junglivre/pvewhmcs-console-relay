@@ -102,71 +102,123 @@ function verifyToken(token, secret) {
     return payload;
 }
 
-function createSeenSidCache() {
-    const seen = new Map();
+function createSessionRegistry() {
+    const sessions = new Map();
 
     setInterval(() => {
         const now = Math.floor(Date.now() / 1000);
-        for (const [sid, expiry] of seen) {
-            if (expiry < now) {
-                seen.delete(sid);
+        for (const [sid, session] of sessions) {
+            if (session.expiresAt < now) {
+                sessions.delete(sid);
             }
         }
     }, 60000).unref();
 
     return {
-        consume(sid, expiry) {
-            if (seen.has(sid)) {
-                return false;
-            }
-            seen.set(sid, expiry);
-
-            return true;
+        get(sid) {
+            return sessions.get(sid);
+        },
+        set(sid, session) {
+            sessions.set(sid, session);
+        },
+        delete(sid) {
+            sessions.delete(sid);
         },
     };
 }
 
 function createRelay(config) {
     const httpServer = http.createServer((req, res) => {
-        if (req.url === '/healthz') {
+        const requestPath = (req.url || '').split('?')[0];
+        const preparePrefix = config.pathPrefix + '/';
+        const prepareSuffix = '/prepare';
+        const isPrepareRequest = requestPath.indexOf(preparePrefix) === 0
+            && requestPath.endsWith(prepareSuffix);
+        const origin = req.headers.origin;
+
+        if (requestPath === '/healthz' && req.method === 'GET') {
             res.writeHead(200, { 'Content-Type': 'text/plain' });
             res.end('ok');
 
             return;
         }
+
+        if (isPrepareRequest && (req.method === 'OPTIONS' || req.method === 'POST')) {
+            const token = requestPath.slice(preparePrefix.length, -prepareSuffix.length);
+            const corsHeaders = {
+                'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With',
+                'Cache-Control': 'no-store',
+            };
+            if (origin) {
+                corsHeaders['Access-Control-Allow-Origin'] = origin;
+                corsHeaders.Vary = 'Origin';
+            }
+
+            if (req.method === 'OPTIONS') {
+                res.writeHead(204, corsHeaders);
+                res.end();
+
+                return;
+            }
+
+            let payload;
+            try {
+                payload = verifyToken(token, config.secret);
+            } catch (err) {
+                log('reject', { reason: err.message });
+                res.writeHead(401, Object.assign({}, corsHeaders, { 'Content-Type': 'application/json' }));
+                res.end(JSON.stringify({ ready: false, error: 'unauthorized' }));
+
+                return;
+            }
+
+            req.resume();
+            const session = getOrCreateSession(payload);
+            if (session.closed) {
+                res.writeHead(409, Object.assign({}, corsHeaders, {
+                    'Content-Type': 'application/json',
+                }));
+                res.end(JSON.stringify({ ready: false, error: 'session already used' }));
+
+                return;
+            }
+            session.readyPromise.then(() => {
+                log('prewarm', { sid: payload.sid, host: payload.host });
+                res.writeHead(200, Object.assign({}, corsHeaders, {
+                    'Content-Type': 'application/json',
+                }));
+                res.end(JSON.stringify({ ready: true }));
+            }).catch(() => {
+                res.writeHead(502, Object.assign({}, corsHeaders, {
+                    'Content-Type': 'application/json',
+                }));
+                res.end(JSON.stringify({ ready: false, error: 'upstream unavailable' }));
+            });
+
+            return;
+        }
+
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not found');
     });
 
     const wss = new WebSocket.Server({ noServer: true });
-    const seenSids = createSeenSidCache();
+    const sessions = createSessionRegistry();
+    const maxBufferedBytes = 1024 * 1024;
 
-    httpServer.on('upgrade', (req, socket, head) => {
-        if (!req.url || req.url.indexOf(config.pathPrefix + '/') !== 0) {
-            socket.destroy();
-
+    const closeSession = (session, clientCode, reason) => {
+        if (session.closed) {
             return;
         }
-        wss.handleUpgrade(req, socket, head, (ws) => {
-            wss.emit('connection', ws, req);
-        });
-    });
+        session.closed = true;
+        clearTimeout(session.sessionTimer);
+        try { if (session.clientWs) session.clientWs.close(clientCode, reason); } catch (e) { /* already closed */ }
+        try { if (session.upstream) session.upstream.close(); } catch (e) { /* already closed */ }
+    };
 
-    wss.on('connection', (clientWs, req) => {
-        const token = req.url.slice(config.pathPrefix.length + 1);
-        let payload;
-        try {
-            payload = verifyToken(token, config.secret);
-            if (!seenSids.consume(payload.sid, payload.exp)) {
-                throw new Error('token already used');
-            }
-        } catch (err) {
-            log('reject', { reason: err.message });
-            clientWs.close(4401, 'unauthorized');
-
-            return;
-        }
-
+    const createUpstream = (session) => new Promise((resolve, reject) => {
+        const payload = session.payload;
         const upstreamUrl = `wss://${payload.host}:${payload.port || 8006}/${payload.path}`;
         const upstreamOrigin = `https://${payload.host}:${payload.port || 8006}`;
         const upstream = new WebSocket(upstreamUrl, {
@@ -177,35 +229,42 @@ function createRelay(config) {
             rejectUnauthorized: payload.verify !== false,
             handshakeTimeout: 10000,
         });
-
-        const pending = [];
-        let upstreamOpen = false;
-
-        const closeBoth = (code, reason) => {
-            try { clientWs.close(code, reason); } catch (e) { /* already closed */ }
-            try { upstream.close(); } catch (e) { /* already closed */ }
-        };
-
-        const sessionTimer = setTimeout(() => {
-            log('session-timeout', { sid: payload.sid });
-            closeBoth(4408, 'session timeout');
-        }, config.maxSessionSeconds * 1000);
-        sessionTimer.unref();
+        session.upstream = upstream;
 
         upstream.on('open', () => {
-            upstreamOpen = true;
-            for (const buffered of pending.splice(0)) {
+            session.upstreamOpen = true;
+            for (const buffered of session.toUpstream.splice(0)) {
                 upstream.send(buffered);
             }
-            log('connected', { sid: payload.sid, host: payload.host });
+            log('connected', {
+                sid: payload.sid,
+                host: payload.host,
+                prewarmed: !session.clientWs,
+            });
         });
 
         upstream.on('message', (data) => {
-            if (clientWs.readyState === WebSocket.OPEN) {
-                clientWs.send(data);
+            if (session.clientWs && session.clientWs.readyState === WebSocket.OPEN) {
+                session.clientWs.send(data);
+
+                return;
             }
+
+            const buffered = Buffer.from(data);
+            if (session.fromUpstreamBytes + buffered.length > maxBufferedBytes) {
+                log('handoff-buffer-overflow', { sid: payload.sid });
+                closeSession(session, 1011, 'handoff buffer overflow');
+
+                return;
+            }
+            session.fromUpstream.push(buffered);
+            session.fromUpstreamBytes += buffered.length;
         });
+
         upstream.on('close', (code, reason) => {
+            if (!session.upstreamOpen) {
+                reject(new Error('upstream closed before handshake'));
+            }
             log('upstream-close', {
                 sid: payload.sid,
                 host: payload.host,
@@ -213,9 +272,9 @@ function createRelay(config) {
                 code,
                 reason: reason.toString(),
             });
-            clearTimeout(sessionTimer);
-            closeBoth(1000, 'upstream closed');
+            closeSession(session, 1000, 'upstream closed');
         });
+
         upstream.on('unexpected-response', (_request, response) => {
             log('upstream-http-error', {
                 sid: payload.sid,
@@ -225,27 +284,106 @@ function createRelay(config) {
                 statusMessage: response.statusMessage,
             });
         });
+
         upstream.on('error', (err) => {
-            log('upstream-error', { sid: payload.sid, host: payload.host, port: payload.port || 8006, message: err.message });
-            clearTimeout(sessionTimer);
-            closeBoth(1011, 'upstream error');
+            reject(err);
+            log('upstream-error', {
+                sid: payload.sid,
+                host: payload.host,
+                port: payload.port || 8006,
+                message: err.message,
+            });
+            closeSession(session, 1011, 'upstream error');
         });
+    });
+
+    const getOrCreateSession = (payload) => {
+        let session = sessions.get(payload.sid);
+        if (session) {
+            return session;
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        session = {
+            payload,
+            clientWs: null,
+            closed: false,
+            upstream: null,
+            upstreamOpen: false,
+            readyPromise: null,
+            toUpstream: [],
+            fromUpstream: [],
+            fromUpstreamBytes: 0,
+            expiresAt: Math.min(
+                now + config.maxSessionSeconds,
+                payload.exp
+            ),
+            sessionTimer: null,
+        };
+        session.sessionTimer = setTimeout(() => {
+            log('session-timeout', { sid: payload.sid });
+            closeSession(session, 4408, 'session timeout');
+        }, Math.max(1000, (session.expiresAt - now) * 1000));
+        session.sessionTimer.unref();
+        sessions.set(payload.sid, session);
+        session.readyPromise = createUpstream(session);
+        session.readyPromise.catch(() => {});
+
+        return session;
+    };
+
+    httpServer.on('upgrade', (req, socket, head) => {
+        const requestPath = (req.url || '').split('?')[0];
+        const prefix = config.pathPrefix + '/';
+        if (requestPath.endsWith('/prepare') || requestPath.indexOf(prefix) !== 0) {
+            socket.destroy();
+
+            return;
+        }
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit('connection', ws, req);
+        });
+    });
+
+    wss.on('connection', (clientWs, req) => {
+        const token = req.url.split('?')[0].slice(config.pathPrefix.length + 1);
+        let payload;
+        try {
+            payload = verifyToken(token, config.secret);
+        } catch (err) {
+            log('reject', { reason: err.message });
+            clientWs.close(4401, 'unauthorized');
+
+            return;
+        }
+
+        const session = getOrCreateSession(payload);
+        if (session.closed) {
+            clientWs.close(4401, 'token already used');
+
+            return;
+        }
+        if (session.clientWs) {
+            clientWs.close(4409, 'console already attached');
+
+            return;
+        }
+        session.clientWs = clientWs;
+        for (const buffered of session.fromUpstream.splice(0)) {
+            clientWs.send(buffered);
+        }
+        session.fromUpstreamBytes = 0;
+        log('viewer-connected', { sid: payload.sid, host: payload.host });
 
         clientWs.on('message', (data) => {
-            if (upstreamOpen) {
-                upstream.send(data);
+            if (session.upstreamOpen) {
+                session.upstream.send(data);
             } else {
-                pending.push(data);
+                session.toUpstream.push(data);
             }
         });
-        clientWs.on('close', () => {
-            clearTimeout(sessionTimer);
-            try { upstream.close(); } catch (e) { /* already closed */ }
-        });
-        clientWs.on('error', () => {
-            clearTimeout(sessionTimer);
-            try { upstream.close(); } catch (e) { /* already closed */ }
-        });
+        clientWs.on('close', () => closeSession(session, 1000, 'viewer closed'));
+        clientWs.on('error', () => closeSession(session, 1011, 'viewer error'));
     });
 
     return httpServer;
@@ -275,4 +413,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { loadConfig, verifyToken, base64UrlDecode, createRelay, createSeenSidCache };
+module.exports = { loadConfig, verifyToken, base64UrlDecode, createRelay, createSessionRegistry };
